@@ -101,6 +101,10 @@ static void                 It_UsbHost_ChannelCallback    ( usb_PeriphId_t usbId
 /** Maximal count of the packets of a stage waited by the busy loops */
 #define IT_USBHOST_LOOP_GUARD               ( 4000000u )
 
+/** Bound of the loops waiting for the reference time [loops]: the longest wait (IT_USBHOST_ATTACH_WAIT_MS at 250 MHz,
+ *  at least 10 clocks per loop) takes less than 125 million loops, so the bound never ends a wait earlier */
+#define IT_USBHOST_WAIT_LOOPS               ( 1000000000u )
+
 #if defined(IT_BOARD_NUCLEO_H503RB)
 /** VBUS switch of the user USB connector (USB_FS_PWR_EN, UM3121 Table 8), active LOW (measured on the board: PA9, the VBUS sense, follows PC10 inverted) */
 #define IT_USBHOST_VBUS_AVAILABLE           ( 1u )
@@ -182,7 +186,8 @@ void It_UsbHost_Init_PowersUpHostModeAndDeinit( void )
     TEST_ASSERT_BITS_HIGH( USB_BCDR_DPPD, USB_DRD_FS->BCDR );
 
     TEST_ASSERT_EQUAL( USB_REQUEST_OK, Usb_Get_HostPortState( USB_PERIPH_FS, &portState ) );
-    TEST_ASSERT_TRUE( ( USB_HOST_PORT_DISCONNECTED == portState ) || ( USB_HOST_PORT_CONNECTED == portState ) );
+    TEST_ASSERT_TRUE( ( USB_HOST_PORT_DISCONNECTED == portState ) ||
+                      ( USB_HOST_PORT_CONNECTED    == portState )    );
 
     TEST_ASSERT_EQUAL( USB_REQUEST_OK, Usb_Deinit( USB_PERIPH_FS ) );
 
@@ -207,17 +212,24 @@ void It_UsbHost_Device_AttachResetAndReadDeviceDescriptor( void )
     const uint8_t       setAddress  [ IT_USBHOST_SETUP_LEN ] = { 0x00u, 0x05u, IT_USBHOST_DEV_ADDRESS, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
     uint8_t             descriptor[ IT_USBHOST_DEV_DESC_LEN ] = { 0u };
     usb_ChannelConfig_t chConfig;
-    usb_HostPortState_t portState = USB_HOST_PORT_CNT;
+    usb_HostPortState_t portState   = USB_HOST_PORT_CNT;
+    usb_RequestState_t  attachState = USB_REQUEST_ERROR;
 
     It_UsbHost_Init_RefTime();
     It_UsbHost_Set_Vbus( GPIO_FUNCTION_ACTIVE );
     It_UsbHost_Init();
 
-    if( USB_REQUEST_OK != It_UsbHost_Wait_Attach( IT_USBHOST_ATTACH_WAIT_MS ) )
+    attachState = It_UsbHost_Wait_Attach( IT_USBHOST_ATTACH_WAIT_MS );
+
+    if( USB_REQUEST_OK != attachState )
     {
         It_UsbHost_Set_Vbus( GPIO_FUNCTION_INACTIVE );
 
         TEST_IGNORE_MESSAGE( "No USB device attached (connect a full speed device to the user USB connector, VBUS 5 V)" );
+    }
+    else
+    {
+        /* Device attached */
     }
 
     TEST_ASSERT_EQUAL( USB_REQUEST_OK, Usb_Get_Speed( USB_PERIPH_FS, &itUsbHost_DevSpeed ) );
@@ -299,11 +311,17 @@ static uint32_t It_UsbHost_Get_TimeMs( void )
 /** Waits for the given time, the controller is served meanwhile */
 static void It_UsbHost_Wait_Ms( uint32_t waitMs )
 {
-    const uint32_t startMs = It_UsbHost_Get_TimeMs();
+    const uint32_t startMs   = It_UsbHost_Get_TimeMs();
+    uint32_t       elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
 
-    while( waitMs > ( It_UsbHost_Get_TimeMs() - startMs ) )
+    for( uint32_t loopIdx = 0u;
+         ( IT_USBHOST_WAIT_LOOPS > loopIdx ) &&
+         ( waitMs > elapsedMs );
+         loopIdx++ )
     {
         Usb_Task();
+
+        elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
     }
 }
 
@@ -365,17 +383,28 @@ static void It_UsbHost_Init( void )
 /** Waits for the finish of a channel transfer, returns its result (error result on a time out) */
 static usb_ChannelResult_t It_UsbHost_Wait_Channel( uint32_t timeoutMs )
 {
-    const uint32_t     startMs = It_UsbHost_Get_TimeMs();
-    usb_ChannelResult_t result = USB_CHANNEL_RESULT_ERROR;
+    const uint32_t      startMs   = It_UsbHost_Get_TimeMs();
+    uint32_t            elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
+    usb_ChannelResult_t result    = USB_CHANNEL_RESULT_ERROR;
 
-    while( ( 0u == itUsbHost_ChDone ) && ( timeoutMs > ( It_UsbHost_Get_TimeMs() - startMs ) ) )
+    for( uint32_t loopIdx = 0u;
+         ( IT_USBHOST_WAIT_LOOPS > loopIdx ) &&
+         ( 0u == itUsbHost_ChDone ) &&
+         ( timeoutMs > elapsedMs );
+         loopIdx++ )
     {
         Usb_Task();
+
+        elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
     }
 
     if( 0u != itUsbHost_ChDone )
     {
         result = itUsbHost_ChResult;
+    }
+    else
+    {
+        /* Time out */
     }
 
     itUsbHost_ChDone = 0u;
@@ -394,6 +423,7 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
     usb_FlagState_t       dataIn      = USB_FLAG_INACTIVE;
     usb_ChannelResult_t   chResult    = USB_CHANNEL_RESULT_OK;
     usb_DataCnt_t         dataCnt     = 0u;
+    usb_RequestState_t    reqState    = USB_REQUEST_ERROR;
 
     if( 0u != ( setupBytes[ 0 ] & USB_EP_ADDR_DIR_IN ) )
     {
@@ -406,7 +436,13 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
 
     itUsbHost_ChDone = 0u;
 
-    if( USB_REQUEST_OK != Usb_Set_ChannelTxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, USB_TOKEN_SETUP, setupBytes, IT_USBHOST_SETUP_LEN ) )
+    reqState = Usb_Set_ChannelTxStart( USB_PERIPH_FS,
+                                       IT_USBHOST_CTRL_CH,
+                                       USB_TOKEN_SETUP,
+                                       setupBytes,
+                                       IT_USBHOST_SETUP_LEN );
+
+    if( USB_REQUEST_OK != reqState )
     {
         chResult = USB_CHANNEL_RESULT_ERROR;
     }
@@ -415,11 +451,14 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
         chResult = It_UsbHost_Wait_Channel( IT_USBHOST_STAGE_TIMEOUT_MS );
     }
 
-    if( ( USB_CHANNEL_RESULT_OK == chResult ) && ( 0u < dataLen ) )
+    if( ( USB_CHANNEL_RESULT_OK == chResult ) &&
+        ( 0u < dataLen                      )    )
     {
         if( USB_FLAG_ACTIVE == dataIn )
         {
-            if( USB_REQUEST_OK == Usb_Set_ChannelRxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, dataBuffer, dataLen ) )
+            reqState = Usb_Set_ChannelRxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, dataBuffer, dataLen );
+
+            if( USB_REQUEST_OK == reqState )
             {
                 chResult = It_UsbHost_Wait_Channel( IT_USBHOST_STAGE_TIMEOUT_MS );
             }
@@ -430,7 +469,9 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
         }
         else
         {
-            if( USB_REQUEST_OK == Usb_Set_ChannelTxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, USB_TOKEN_OUT, dataBuffer, dataLen ) )
+            reqState = Usb_Set_ChannelTxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, USB_TOKEN_OUT, dataBuffer, dataLen );
+
+            if( USB_REQUEST_OK == reqState )
             {
                 chResult = It_UsbHost_Wait_Channel( IT_USBHOST_STAGE_TIMEOUT_MS );
             }
@@ -442,13 +483,20 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
 
         dataCnt = itUsbHost_ChCnt;
     }
+    else
+    {
+        /* No data stage */
+    }
 
     if( USB_CHANNEL_RESULT_OK == chResult )
     {
         /* Status stage: the direction is opposite to the data stage, a request without a data stage has an IN status */
-        if( ( USB_FLAG_ACTIVE == dataIn ) && ( 0u < dataLen ) )
+        if( ( USB_FLAG_ACTIVE == dataIn ) &&
+            ( 0u < dataLen             )    )
         {
-            if( USB_REQUEST_OK == Usb_Set_ChannelTxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, USB_TOKEN_OUT, NULL, 0u ) )
+            reqState = Usb_Set_ChannelTxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, USB_TOKEN_OUT, NULL, 0u );
+
+            if( USB_REQUEST_OK == reqState )
             {
                 chResult = It_UsbHost_Wait_Channel( IT_USBHOST_STAGE_TIMEOUT_MS );
             }
@@ -459,7 +507,9 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
         }
         else
         {
-            if( USB_REQUEST_OK == Usb_Set_ChannelRxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, NULL, 0u ) )
+            reqState = Usb_Set_ChannelRxStart( USB_PERIPH_FS, IT_USBHOST_CTRL_CH, NULL, 0u );
+
+            if( USB_REQUEST_OK == reqState )
             {
                 chResult = It_UsbHost_Wait_Channel( IT_USBHOST_STAGE_TIMEOUT_MS );
             }
@@ -468,6 +518,10 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
                 chResult = USB_CHANNEL_RESULT_ERROR;
             }
         }
+    }
+    else
+    {
+        /* Transfer failed - no status stage */
     }
 
     itUsbHost_ChCnt = dataCnt;
@@ -479,12 +533,19 @@ static usb_ChannelResult_t It_UsbHost_Control( const uint8_t * setupBytes, uint8
 /** Waits until a device is attached */
 static usb_RequestState_t It_UsbHost_Wait_Attach( uint32_t timeoutMs )
 {
-    const uint32_t     startMs  = It_UsbHost_Get_TimeMs();
-    usb_RequestState_t retState = USB_REQUEST_ERROR;
+    const uint32_t     startMs   = It_UsbHost_Get_TimeMs();
+    uint32_t           elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
+    usb_RequestState_t retState  = USB_REQUEST_ERROR;
 
-    while( ( 0u == itUsbHost_ConnectCnt ) && ( timeoutMs > ( It_UsbHost_Get_TimeMs() - startMs ) ) )
+    for( uint32_t loopIdx = 0u;
+         ( IT_USBHOST_WAIT_LOOPS > loopIdx ) &&
+         ( 0u == itUsbHost_ConnectCnt ) &&
+         ( timeoutMs > elapsedMs );
+         loopIdx++ )
     {
         Usb_Task();
+
+        elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
     }
 
     if( 0u != itUsbHost_ConnectCnt )
@@ -516,26 +577,49 @@ static usb_RequestState_t It_UsbHost_Reset_Port( void )
 
         retState = Usb_Set_HostPortResetInactive( USB_PERIPH_FS );
     }
+    else
+    {
+        /* Reset signaling not started */
+    }
 
     if( USB_REQUEST_OK == retState )
     {
-        const uint32_t startMs = It_UsbHost_Get_TimeMs();
+        const uint32_t startMs   = It_UsbHost_Get_TimeMs();
+        uint32_t       elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
 
-        while( ( USB_HOST_PORT_ENABLED != portState ) && ( IT_USBHOST_ENABLE_WAIT_MS > ( It_UsbHost_Get_TimeMs() - startMs ) ) )
+        for( uint32_t loopIdx = 0u;
+             ( IT_USBHOST_WAIT_LOOPS > loopIdx ) &&
+             ( USB_HOST_PORT_ENABLED != portState ) &&
+             ( IT_USBHOST_ENABLE_WAIT_MS > elapsedMs );
+             loopIdx++ )
         {
             Usb_Task();
             retState = Usb_Get_HostPortState( USB_PERIPH_FS, &portState );
+
+            elapsedMs = It_UsbHost_Get_TimeMs() - startMs;
         }
 
         if( USB_HOST_PORT_ENABLED != portState )
         {
             retState = USB_REQUEST_ERROR;
         }
+        else
+        {
+            /* Port enabled */
+        }
+    }
+    else
+    {
+        /* Reset signaling not finished */
     }
 
     if( USB_REQUEST_OK == retState )
     {
         It_UsbHost_Wait_Ms( IT_USBHOST_RECOVERY_MS );
+    }
+    else
+    {
+        /* Port not enabled */
     }
 
     return ( retState );

@@ -53,6 +53,10 @@ static void                 It_Usb_Send_Control         ( const uint8_t * data, 
 /** Time in which the host shall finish the enumeration (device configured) after the first bus reset */
 #define IT_USB_ENUMERATION_MS               ( 10000u )
 
+/** Bound of the loops waiting for the host [loops]: the longest wait (IT_USB_ENUMERATION_MS at 250 MHz, at least
+ *  10 clocks per loop) takes less than 250 million loops, so the bound never ends a wait earlier */
+#define IT_USB_WAIT_LOOPS                   ( 1000000000u )
+
 /** Kernel clock required by the controller */
 #define IT_USB_KERNEL_CLK_HZ                ( 48000000u )
 
@@ -365,8 +369,11 @@ void It_Usb_Enumeration_HostConfiguresDevice( void )
     TEST_ASSERT_EQUAL( TIM_REQUEST_OK, Tim_Get_Counter( IT_USB_REF_TIM, &startCnt ) );
     TEST_ASSERT_EQUAL( USB_REQUEST_OK, Usb_Set_DeviceConnect( USB_PERIPH_FS ) );
 
-    while( ( 0u == itUsb_SetupCnt ) &&
-           ( IT_USB_HOST_DETECT_MS > elapsedMs ) )
+    for( uint32_t loopIdx = 0u;
+         ( IT_USB_WAIT_LOOPS > loopIdx ) &&
+         ( 0u == itUsb_SetupCnt ) &&
+         ( IT_USB_HOST_DETECT_MS > elapsedMs );
+         loopIdx++ )
     {
         Usb_Task();
         elapsedMs = It_Usb_Get_ElapsedMs( startCnt );
@@ -376,19 +383,28 @@ void It_Usb_Enumeration_HostConfiguresDevice( void )
     {
         TEST_IGNORE_MESSAGE( "No USB host connected (connect the board USB connector to a PC)" );
     }
+    else
+    {
+        /* Host connected */
+    }
 
     TEST_ASSERT_EQUAL( TIM_REQUEST_OK, Tim_Get_Counter( IT_USB_REF_TIM, &startCnt ) );
     elapsedMs = 0u;
 
-    while( ( 0u == itUsb_Configured ) &&
-           ( 0u == itUsb_ConfigRead ) &&
-           ( IT_USB_ENUMERATION_MS > elapsedMs ) )
+    for( uint32_t loopIdx = 0u;
+         ( IT_USB_WAIT_LOOPS > loopIdx ) &&
+         ( 0u == itUsb_Configured ) &&
+         ( 0u == itUsb_ConfigRead ) &&
+         ( IT_USB_ENUMERATION_MS > elapsedMs );
+         loopIdx++ )
     {
         Usb_Task();
         elapsedMs = It_Usb_Get_ElapsedMs( startCnt );
     }
 
-    TEST_ASSERT_TRUE_MESSAGE( ( 0u != itUsb_Configured ) || ( 0u != itUsb_ConfigRead ), "Host did not read the configuration descriptor" );
+    TEST_ASSERT_TRUE_MESSAGE( ( 0u != itUsb_Configured ) ||
+                              ( 0u != itUsb_ConfigRead  ),
+                              "Host did not read the configuration descriptor" );
     TEST_ASSERT_EQUAL( USB_REQUEST_OK, Usb_Get_DeviceState( USB_PERIPH_FS, &devState ) );
     TEST_ASSERT_EQUAL( USB_DEVICE_STATE_ADDRESSED, devState );
     TEST_ASSERT_TRUE( 0u < itUsb_ControlDoneCnt );
@@ -503,16 +519,27 @@ static void It_Usb_ResetCallback( usb_PeriphId_t usbId )
  */
 static void It_Usb_Send_Control( const uint8_t * data, uint32_t dataLen, uint32_t requestedLen )
 {
-    uint32_t sendLen = dataLen;
+    uint32_t           sendLen  = dataLen;
+    usb_RequestState_t reqState = USB_REQUEST_ERROR;
 
     if( requestedLen < dataLen )
     {
         sendLen = requestedLen;
     }
+    else
+    {
+        /* The whole data is sent */
+    }
 
-    if( USB_REQUEST_OK != Usb_Set_EpTxStart( USB_PERIPH_FS, USB_EP_ADDR_IN( 0u ), data, sendLen ) )
+    reqState = Usb_Set_EpTxStart( USB_PERIPH_FS, USB_EP_ADDR_IN( 0u ), data, sendLen );
+
+    if( USB_REQUEST_OK != reqState )
     {
         itUsb_StallCnt ++;
+    }
+    else
+    {
+        /* Data stage started */
     }
 }
 
@@ -547,6 +574,10 @@ static void It_Usb_SetupCallback( usb_PeriphId_t usbId, const usb_SetupPacket_t 
             {
                 itUsb_ConfigRead = 1u;
             }
+            else
+            {
+                /* The host reads only the beginning of the descriptor */
+            }
         }
         else
         {
@@ -555,17 +586,25 @@ static void It_Usb_SetupCallback( usb_PeriphId_t usbId, const usb_SetupPacket_t 
     }
     else if( IT_USB_REQ_SET_ADDRESS == setupPacket->Request )
     {
-        if( USB_REQUEST_OK == Usb_Set_DeviceAddress( usbId, (usb_DevAddr_t)( setupPacket->Value & USB_DEV_ADDR_MAX ) ) )
+        const usb_DevAddr_t      devAddr   = (usb_DevAddr_t)( setupPacket->Value & USB_DEV_ADDR_MAX );
+        const usb_RequestState_t addrState = Usb_Set_DeviceAddress( usbId, devAddr );
+
+        if( USB_REQUEST_OK == addrState )
         {
             (void)Usb_Set_EpTxStart( usbId, USB_EP_ADDR_IN( 0u ), USB_NULL_PTR, 0u );
             handled = USB_FLAG_ACTIVE;
+        }
+        else
+        {
+            /* Address not set (stall) */
         }
     }
     else if( IT_USB_REQ_SET_CONFIGURATION == setupPacket->Request )
     {
         if( 1u == setupPacket->Value )
         {
-            usb_EpConfig_t epConfig;
+            usb_EpConfig_t     epConfig;
+            usb_RequestState_t initState = USB_REQUEST_ERROR;
 
             epConfig.Address       = IT_USB_EP_BULK_IN;
             epConfig.Type          = USB_EP_TYPE_BULK;
@@ -575,11 +614,15 @@ static void It_Usb_SetupCallback( usb_PeriphId_t usbId, const usb_SetupPacket_t 
             (void)Usb_Deinit_Endpoint( usbId, IT_USB_EP_BULK_IN );
             (void)Usb_Deinit_Endpoint( usbId, IT_USB_EP_BULK_OUT );
 
-            if( USB_REQUEST_OK == Usb_Init_Endpoint( usbId, &epConfig ) )
+            initState = Usb_Init_Endpoint( usbId, &epConfig );
+
+            if( USB_REQUEST_OK == initState )
             {
                 epConfig.Address = IT_USB_EP_BULK_OUT;
 
-                if( USB_REQUEST_OK == Usb_Init_Endpoint( usbId, &epConfig ) )
+                initState = Usb_Init_Endpoint( usbId, &epConfig );
+
+                if( USB_REQUEST_OK == initState )
                 {
                     itUsb_ConfigValue = 1u;
                     itUsb_Configured  = 1u;
@@ -587,6 +630,14 @@ static void It_Usb_SetupCallback( usb_PeriphId_t usbId, const usb_SetupPacket_t 
                     (void)Usb_Set_EpTxStart( usbId, USB_EP_ADDR_IN( 0u ), USB_NULL_PTR, 0u );
                     handled = USB_FLAG_ACTIVE;
                 }
+                else
+                {
+                    /* Bulk OUT endpoint not initialized (stall) */
+                }
+            }
+            else
+            {
+                /* Bulk IN endpoint not initialized (stall) */
             }
         }
         else if( 0u == setupPacket->Value )
